@@ -1,34 +1,49 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Hands } from "@mediapipe/hands";
-import { Camera } from "@mediapipe/camera_utils";
+import { useEffect, useMemo, useRef, useState } from "react";
+
+const HANDS_SRC = "https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js";
+const CAMERA_SRC = "https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js";
+const scriptCache = new Map();
 
 const COLORS = [
-  { name: "Black", value: "#0b0b0b" },
-  { name: "Coral", value: "#ff5a5f" },
-  { name: "Sun", value: "#ffb703" },
-  { name: "Sky", value: "#219ebc" },
-  { name: "Mint", value: "#2ec4b6" },
-  { name: "Violet", value: "#6c5ce7" }
+  { name: "Black", value: "#000000" },
+  { name: "Red", value: "#ff5a5f" },
+  { name: "Blue", value: "#0066ff" },
 ];
 
-const SIZES = [4, 8, 14, 22];
+const SIZES = [2, 5, 10, 15, 20];
 
-const PINCH_THRESHOLD = 0.045;
-const CURSOR_RADIUS = 8;
-const SMOOTHING = 0.35;
-const PINCH_SCALE = 0.25;
-const PINCH_HYSTERESIS = 1.4;
-const PINCH_FRAMES = 2;
-const DRAW_DELAY_MS = 600;
+const PINCH_THRESHOLD = 30;
+const PINCH_SCALE = 0.5;
+const PINCH_HYSTERESIS = 1.2;
+const PINCH_FRAMES = 3;
+const DRAW_DELAY_MS = 100;
+const SMOOTHING = 0.3;
+const CURSOR_RADIUS = 12;
+
+async function loadMediapipeModule(globalName, src) {
+  if (typeof window === "undefined") return null;
+  if (window[globalName]) return window[globalName];
+
+  if (scriptCache.has(src)) {
+    return scriptCache.get(src);
+  }
+
+  return new Promise((resolve) => {
+    const script = document.createElement("script");
+    script.src = src;
+    script.onload = () => {
+      scriptCache.set(src, window[globalName]);
+      resolve(window[globalName]);
+    };
+    document.head.appendChild(script);
+  });
+}
 
 function distance(a, b) {
-  const dx = a.x - b.x;
-  const dy = a.y - b.y;
-  return Math.hypot(dx, dy);
+  return Math.sqrt(Math.pow(a.x - b.x, 2) + Math.pow(a.y - b.y, 2));
 }
 
 function drawStroke(ctx, from, to, color, size) {
-  if (!from || !to) return;
   ctx.strokeStyle = color;
   ctx.lineWidth = size;
   ctx.lineCap = "round";
@@ -39,7 +54,19 @@ function drawStroke(ctx, from, to, color, size) {
   ctx.stroke();
 }
 
+function projectLandmark(landmark, canvas) {
+  if (!canvas) return { x: landmark.x, y: landmark.y };
+  return {
+    x: (1 - landmark.x) * canvas.width,
+    y: landmark.y * canvas.height
+  };
+}
+
 export default function App() {
+  const [color, setColor] = useState("#000000");
+  const [size, setSize] = useState(5);
+  const [ready, setReady] = useState(false);
+  const [error, setError] = useState("");
   const videoRef = useRef(null);
   const paintCanvasRef = useRef(null);
   const overlayCanvasRef = useRef(null);
@@ -51,138 +78,127 @@ export default function App() {
   const pinchActiveRef = useRef(false);
   const pinchFramesRef = useRef(0);
   const pinchStartTimeRef = useRef(0);
-  const colorRef = useRef(COLORS[0].value);
-  const sizeRef = useRef(SIZES[1]);
+  const colorRef = useRef(color);
+  const sizeRef = useRef(size);
 
-  const [color, setColor] = useState(COLORS[0].value);
-  const [size, setSize] = useState(SIZES[1]);
-  const [ready, setReady] = useState(false);
-  const [error, setError] = useState("");
-
-  const statusLabel = useMemo(() => {
-    if (error) return error;
-    return ready ? "Camera active" : "Camera off";
-  }, [ready, error]);
-
-  useEffect(() => {
-    function syncCanvas() {
-      const paintCanvas = paintCanvasRef.current;
-      const overlayCanvas = overlayCanvasRef.current;
-      const video = videoRef.current;
-      if (!paintCanvas || !overlayCanvas) return;
-
-      const width = video?.videoWidth || 1280;
-      const height = video?.videoHeight || 720;
-
-      paintCanvas.width = width;
-      paintCanvas.height = height;
-      overlayCanvas.width = width;
-      overlayCanvas.height = height;
-    }
-
-    window.addEventListener("resize", syncCanvas);
-    syncCanvas();
-
-    return () => window.removeEventListener("resize", syncCanvas);
-  }, []);
+  const statusLabel = error || (ready ? "Ready to paint" : "Camera disabled");
 
   useEffect(() => {
     colorRef.current = color;
-    sizeRef.current = size;
-  }, [color, size]);
+  }, [color]);
 
   useEffect(() => {
-    const hands = new Hands({
-      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
-    });
+    sizeRef.current = size;
+  }, [size]);
 
-    hands.setOptions({
-      maxNumHands: 1,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence: 0.5
-    });
+  useEffect(() => {
+    let cancelled = false;
 
-    hands.onResults((results) => {
-      const overlayCanvas = overlayCanvasRef.current;
-      const paintCanvas = paintCanvasRef.current;
-      if (!overlayCanvas || !paintCanvas) return;
-
-      const overlayCtx = overlayCanvas.getContext("2d");
-      const paintCtx = paintCanvas.getContext("2d");
-      overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-
-      const landmarks = results.multiHandLandmarks?.[0];
-      if (!landmarks) {
-        prevPointRef.current = null;
-        smoothedPointRef.current = null;
-        pinchActiveRef.current = false;
-        pinchFramesRef.current = 0;
-        pinchStartTimeRef.current = 0;
-        return;
-      }
-
-      const indexTip = landmarks[8];
-      const thumbTip = landmarks[4];
-      const handSize = distance(landmarks[0], landmarks[9]);
-      const pinchThreshold = Math.max(PINCH_THRESHOLD, handSize * PINCH_SCALE);
-      const pinchOn = pinchThreshold;
-      const pinchOff = pinchThreshold * PINCH_HYSTERESIS;
-      const pinchDistance = distance(indexTip, thumbTip);
-
-      if (pinchActiveRef.current) {
-        if (pinchDistance > pinchOff) {
-          pinchActiveRef.current = false;
-          pinchFramesRef.current = 0;
-          pinchStartTimeRef.current = 0;
+    loadMediapipeModule("Hands", HANDS_SRC)
+      .then((HandsApi) => {
+        if (cancelled || !HandsApi) {
+          throw new Error("Hands API unavailable");
         }
-      } else if (pinchDistance < pinchOn) {
-        pinchFramesRef.current += 1;
-        if (pinchFramesRef.current >= PINCH_FRAMES) {
-          pinchActiveRef.current = true;
-          pinchStartTimeRef.current = performance.now();
+
+        const hands = new HandsApi({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+
+        hands.setOptions({
+          maxNumHands: 1,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+
+        hands.onResults((results) => {
+          const overlayCanvas = overlayCanvasRef.current;
+          const paintCanvas = paintCanvasRef.current;
+          if (!overlayCanvas || !paintCanvas) return;
+
+          const overlayCtx = overlayCanvas.getContext("2d");
+          const paintCtx = paintCanvas.getContext("2d");
+          overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+          const landmarks = results.multiHandLandmarks?.[0];
+          if (!landmarks) {
+            prevPointRef.current = null;
+            smoothedPointRef.current = null;
+            pinchActiveRef.current = false;
+            pinchFramesRef.current = 0;
+            pinchStartTimeRef.current = 0;
+            return;
+          }
+
+          const indexTip = projectLandmark(landmarks[8], paintCanvas);
+          const thumbTip = projectLandmark(landmarks[4], paintCanvas);
+          const wrist = projectLandmark(landmarks[0], paintCanvas);
+          const middleBase = projectLandmark(landmarks[9], paintCanvas);
+          const handSize = distance(wrist, middleBase);
+          const pinchThreshold = Math.max(PINCH_THRESHOLD, handSize * PINCH_SCALE);
+          const pinchOn = pinchThreshold;
+          const pinchOff = pinchThreshold * PINCH_HYSTERESIS;
+          const pinchDistance = distance(indexTip, thumbTip);
+
+          if (pinchActiveRef.current) {
+            if (pinchDistance > pinchOff) {
+              pinchActiveRef.current = false;
+              pinchFramesRef.current = 0;
+              pinchStartTimeRef.current = 0;
+            }
+          } else if (pinchDistance < pinchOn) {
+            pinchFramesRef.current += 1;
+            if (pinchFramesRef.current >= PINCH_FRAMES) {
+              pinchActiveRef.current = true;
+              pinchStartTimeRef.current = performance.now();
+            }
+          } else {
+            pinchFramesRef.current = 0;
+          }
+
+          const pinch = pinchActiveRef.current;
+          const canDraw =
+            pinch && performance.now() - (pinchStartTimeRef.current || 0) >= DRAW_DELAY_MS;
+
+          const point = indexTip;
+
+          const last = smoothedPointRef.current || point;
+          const smoothed = {
+            x: last.x + (point.x - last.x) * SMOOTHING,
+            y: last.y + (point.y - last.y) * SMOOTHING
+          };
+          smoothedPointRef.current = smoothed;
+
+          overlayCtx.beginPath();
+          overlayCtx.fillStyle = pinch ? "#ff5a5f" : "#111111";
+          overlayCtx.arc(smoothed.x, smoothed.y, CURSOR_RADIUS, 0, Math.PI * 2);
+          overlayCtx.fill();
+
+          if (canDraw) {
+            const previous = prevPointRef.current;
+            if (previous) {
+              drawStroke(paintCtx, previous, smoothed, colorRef.current, sizeRef.current);
+            }
+            prevPointRef.current = smoothed;
+          } else {
+            prevPointRef.current = null;
+          }
+        });
+
+        handsRef.current = hands;
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setError("Failed to load Mediapipe Hands. Check your network connection.");
         }
-      } else {
-        pinchFramesRef.current = 0;
-      }
-
-      const pinch = pinchActiveRef.current;
-      const canDraw =
-        pinch && performance.now() - (pinchStartTimeRef.current || 0) >= DRAW_DELAY_MS;
-
-      const point = {
-        x: (1 - indexTip.x) * paintCanvas.width,
-        y: indexTip.y * paintCanvas.height
-      };
-
-      const last = smoothedPointRef.current || point;
-      const smoothed = {
-        x: last.x + (point.x - last.x) * SMOOTHING,
-        y: last.y + (point.y - last.y) * SMOOTHING
-      };
-      smoothedPointRef.current = smoothed;
-
-      overlayCtx.beginPath();
-      overlayCtx.fillStyle = pinch ? "#ff5a5f" : "#111111";
-      overlayCtx.arc(smoothed.x, smoothed.y, CURSOR_RADIUS, 0, Math.PI * 2);
-      overlayCtx.fill();
-
-      if (canDraw) {
-        const previous = prevPointRef.current;
-        if (previous) {
-          drawStroke(paintCtx, previous, smoothed, colorRef.current, sizeRef.current);
-        }
-        prevPointRef.current = smoothed;
-      } else {
-        prevPointRef.current = null;
-      }
-    });
-
-    handsRef.current = hands;
+      });
 
     return () => {
-      hands.close();
-      handsRef.current = null;
+      cancelled = true;
+      if (handsRef.current) {
+        handsRef.current.close();
+        handsRef.current = null;
+      }
     };
   }, []);
 
@@ -198,7 +214,14 @@ export default function App() {
     }
 
     try {
-      const camera = new Camera(video, {
+      const CameraApi = await loadMediapipeModule("Camera", CAMERA_SRC);
+      if (!CameraApi) {
+        setError("Mediapipe camera utilities failed to load.");
+        setReady(false);
+        return;
+      }
+
+      const camera = new CameraApi(video, {
         onFrame: async () => {
           await hands.send({ image: video });
         },
